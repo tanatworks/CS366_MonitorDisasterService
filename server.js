@@ -16,7 +16,7 @@ const calculateDisasterStatus = (waterLevel) => {
     return "NORMAL";
 };
 
-// Helper Function: Publish Async Event
+// Asynchronous: Publish event to notification service (simulated with setTimeout)
 const publishEvent = (
     areaId,
     prevStatus,
@@ -52,12 +52,30 @@ const publishEvent = (
     }, 500);
 };
 
-// API #1: Ingest Data (POST /api/monitor-disaster/ingest)
+// Background Job: Check Outdated Data (runs every 1 minute)
+setInterval(() => {
+    const now = new Date();
+    Object.keys(db).forEach((area_id) => {
+        const area = db[area_id];
+        const lastUpdatedDate = new Date(area.last_updated);
+        const diffMinutes = (now - lastUpdatedDate) / (1000 * 60);
+
+        if (diffMinutes > 15 && !area.is_outdated) {
+            db[area_id].is_outdated = true;
+            console.log(
+                `\n[SYSTEM WARNING] Area ${area_id} data is outdated (>15 mins). Flag set to true.`,
+            );
+        } else if (diffMinutes <= 15 && area.is_outdated) {
+            db[area_id].is_outdated = false;
+        }
+    });
+}, 60000);
+
+// API #1 [POST]: Ingest Data
 app.post("/api/monitor-disaster/ingest", (req, res) => {
     const { area_id, source_api, water_level_cm, rainfall_mm, timestamp } =
         req.body;
 
-    // Validation
     if (
         !area_id ||
         !source_api ||
@@ -70,7 +88,6 @@ app.post("/api/monitor-disaster/ingest", (req, res) => {
         });
     }
 
-    // Retrieve existing data or set default
     const area = db[area_id] || {
         area_id,
         disaster_status: "NORMAL",
@@ -78,7 +95,6 @@ app.post("/api/monitor-disaster/ingest", (req, res) => {
         last_updated: "2000-01-01",
     };
 
-    // Idempotency: Ignore older or duplicated data
     if (new Date(timestamp) <= new Date(area.last_updated)) {
         return res.status(200).json({
             message: "Old data ignored",
@@ -86,27 +102,25 @@ app.post("/api/monitor-disaster/ingest", (req, res) => {
         });
     }
 
-    // Calculate new status
     let new_status = calculateDisasterStatus(water_level_cm);
 
-    // Concurrency Control: Retain status if manually overridden by Dispatcher
+    // Concurrency Control: Lock the status if manually overridden
     if (area.is_manual_override) {
         new_status = area.disaster_status;
     }
 
     const prev_status = area.disaster_status;
 
-    // Save to Database
     db[area_id] = {
         ...area,
         water_level_cm,
         rainfall_mm,
         disaster_status: new_status,
         source_api,
+        is_outdated: false,
         last_updated: timestamp,
     };
 
-    // Publish Event
     publishEvent(
         area_id,
         prev_status,
@@ -122,7 +136,7 @@ app.post("/api/monitor-disaster/ingest", (req, res) => {
     });
 });
 
-// API #2: Get Area Status (GET /api/monitor-disaster/areas/:area_id)
+// API #2 [GET]: Get Area Status
 app.get("/api/monitor-disaster/areas/:area_id", (req, res) => {
     const area = db[req.params.area_id];
 
@@ -132,23 +146,40 @@ app.get("/api/monitor-disaster/areas/:area_id", (req, res) => {
         });
     }
 
+    // Now returns is_manual_override so you can verify it's locked
     res.status(200).json({
         area_id: area.area_id,
         disaster_status: area.disaster_status,
         water_level_cm: area.water_level_cm,
         is_outdated: area.is_outdated || false,
+        is_manual_override: area.is_manual_override || false,
+        status_description: area.status_description || null,
         last_updated: area.last_updated,
     });
 });
 
-// API #3: Override Status (PATCH /api/monitor-disaster/areas/:area_id/status)
+// API #4 [GET]: Get All Areas (Dashboard)
+app.get("/api/monitor-disaster/areas", (req, res) => {
+    const allAreas = Object.values(db).map((area) => ({
+        area_id: area.area_id,
+        disaster_status: area.disaster_status,
+        water_level_cm: area.water_level_cm,
+        is_outdated: area.is_outdated || false,
+        is_manual_override: area.is_manual_override || false,
+        status_description: area.status_description || null,
+        last_updated: area.last_updated,
+    }));
+
+    res.status(200).json(allAreas);
+});
+
+// API #3 [PATCH]: Manually Override Status
 app.patch("/api/monitor-disaster/areas/:area_id/status", (req, res) => {
     const { disaster_status, status_description, overridden_by } = req.body;
     const { area_id } = req.params;
 
     const validStatuses = ["NORMAL", "WATCH", "WARNING", "CRITICAL"];
 
-    // Validation
     if (
         !validStatuses.includes(disaster_status) ||
         !status_description ||
@@ -168,12 +199,11 @@ app.patch("/api/monitor-disaster/areas/:area_id/status", (req, res) => {
 
     const prev_status = area.disaster_status;
 
-    // Update state and set manual override flag
     db[area_id] = {
         ...area,
         disaster_status,
         status_description,
-        is_manual_override: true,
+        is_manual_override: true, // This flag is set to true
         last_updated: new Date().toISOString(),
     };
 
@@ -187,6 +217,15 @@ app.patch("/api/monitor-disaster/areas/:area_id/status", (req, res) => {
     );
 
     res.status(200).json({ message: "Status overridden successfully" });
+});
+
+// DEBUG API: Dump everything from memory
+app.get("/api/monitor-disaster/debug/db", (req, res) => {
+    res.status(200).json({
+        total_areas: Object.keys(db).length,
+        database: db,
+        audit_log: auditLog,
+    });
 });
 
 const PORT = 3000;
