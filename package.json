@@ -19,6 +19,11 @@
     },
     "homepage": "https://github.com/tanatworks/monitor-disaster-service#readme",
     "dependencies": {
+        "@aws-sdk/client-dynamodb": "^3.1005.0",
+        "@aws-sdk/client-sns": "^3.1006.0",
+        "@aws-sdk/client-sqs": "^3.1005.0",
+        "@aws-sdk/lib-dynamodb": "^3.1005.0",
+        "dotenv": "^17.3.1",
         "express": "^5.2.1"
     }
 }
