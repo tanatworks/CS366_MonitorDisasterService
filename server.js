@@ -1,6 +1,8 @@
 require("dotenv").config();
 const express = require("express");
 const crypto = require("crypto");
+const axios = require("axios");
+const cron = require("node-cron");
 
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const {
@@ -9,41 +11,101 @@ const {
     PutCommand,
     ScanCommand,
     UpdateCommand,
+    DeleteCommand,
 } = require("@aws-sdk/lib-dynamodb");
 
 const { SNSClient, PublishCommand } = require("@aws-sdk/client-sns");
+const {
+    SQSClient,
+    ReceiveMessageCommand,
+    DeleteMessageCommand,
+} = require("@aws-sdk/client-sqs");
 
 const app = express();
 app.use(express.json());
+
+// --- 1. Configuration ---
+const REPORT_SERVICE_URL =
+    process.env.REPORT_SERVICE_URL ||
+    "https://d8a7ds12a2.execute-api.us-east-1.amazonaws.com/dev/v1/reports";
+const REPORT_API_KEY =
+    process.env.REPORT_API_KEY || "Hk3gkvihdf5scu0ZPJKGn1EsvX74Ny2m5gKDTxDe";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const SNS_TOPIC_ARN =
     process.env.SNS_TOPIC_ARN ||
     "arn:aws:sns:us-east-1:462632273029:MonitoringDisaster-Topic";
 
+const SQS_EVENTS_QUEUE_URL =
+    process.env.SQS_EVENTS_QUEUE_URL ||
+    "https://sqs.us-east-1.amazonaws.com/462632273029/monitor-disaster-events-queue";
+const SQS_STATUS_QUEUE_URL =
+    process.env.SQS_STATUS_QUEUE_URL ||
+    "https://sqs.us-east-1.amazonaws.com/462632273029/monitor-disaster-status-queue";
+
+const MY_DISASTER_API_KEY =
+    process.env.MY_DISASTER_API_KEY ||
+    "disaster-monitoring-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6";
+
 const ddbClient = new DynamoDBClient({ region: REGION });
 const docClient = DynamoDBDocumentClient.from(ddbClient);
-
-const snsClient = new SNSClient({ region: "us-east-1" });
+const snsClient = new SNSClient({ region: REGION });
+const sqsClient = new SQSClient({ region: REGION });
 
 const TABLE_AREAS = "Disaster_Areas";
 const TABLE_AUDIT_LOGS = "Disaster_AuditLogs";
 const TABLE_INCIDENT_REPORTS = "Disaster_IncidentReports";
 
-// Function: Calculate disaster status based on water level
-const calculateDisasterStatus = (waterLevel) => {
-    if (waterLevel >= 150) return "CRITICAL";
-    if (waterLevel >= 100) return "WARNING";
-    if (waterLevel >= 50) return "WATCH";
+// --- 2. Middleware ---
+app.use((req, res, next) => {
+    const awsTraceId = req.headers["x-amzn-trace-id"];
+    req.traceId = awsTraceId || crypto.randomUUID();
+    res.setHeader("X-Trace-Id", req.traceId);
+    next();
+});
+
+const apiKeyAuth = (req, res, next) => {
+    const clientKey = req.header("X-Api-Key");
+    if (!clientKey || clientKey !== MY_DISASTER_API_KEY) {
+        return res
+            .status(401)
+            .json({ error: "UNAUTHORIZED", traceId: req.traceId });
+    }
+    next();
+};
+
+// --- 3. Helpers ---
+const calculateDisasterStatus = (water, rain) => {
+    if (water >= 150 || rain >= 100) return "CRITICAL";
+    if (water >= 100 || rain >= 50) return "WARNING";
+    if (water >= 50 || rain >= 20) return "WATCH";
     return "NORMAL";
 };
-// Function: Text -> Impact Level (1-4)
+
 const getImpactLevel = (status) => {
     const levels = { CRITICAL: 4, WARNING: 3, WATCH: 2, NORMAL: 1 };
     return levels[status] || 1;
 };
 
-// Event Publisher & Incident Logger (SQS + DynamoDB)
+const hasActiveIncident = async (areaId) => {
+    try {
+        const response = await docClient.send(
+            new ScanCommand({
+                TableName: TABLE_INCIDENT_REPORTS,
+                FilterExpression:
+                    "area_id = :aid AND sync_status <> :closedStatus",
+                ExpressionAttributeValues: {
+                    ":aid": areaId,
+                    ":closedStatus": "CLOSED",
+                },
+            }),
+        );
+        return response.Items && response.Items.length > 0;
+    } catch (err) {
+        return false;
+    }
+};
+
 const publishEvent = async (
     areaId,
     prevStatus,
@@ -51,221 +113,213 @@ const publishEvent = async (
     waterLevel,
     rainfall,
     trigger,
+    incidentId = null,
 ) => {
     if (prevStatus === currStatus) return;
-
     const eventId = crypto.randomUUID();
-    const incidentId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
-    const impactLevel = getImpactLevel(currStatus);
-
-    // 1. Save to Audit Logs
-    await docClient.send(
-        new PutCommand({
-            TableName: TABLE_AUDIT_LOGS,
-            Item: {
-                logId: eventId,
-                area_id: areaId,
-                previous_status: prevStatus,
-                new_status: currStatus,
-                water_level_cm: waterLevel,
-                rainfall_mm: rainfall,
-                triggered_by: trigger,
-                createdAt: createdAt,
-            },
-        }),
-    );
-
-    // 2. Save to Incident Reports (Outbox) - Status: PENDING
-    const description = `Status changed to ${currStatus} due to water level reaching ${waterLevel} cm.`;
-
-    await docClient.send(
-        new PutCommand({
-            TableName: TABLE_INCIDENT_REPORTS,
-            Item: {
-                incident_id: incidentId,
-                area_id: areaId,
-                incident_type: "flood",
-                incident_description: description,
-                impact_level: impactLevel,
-                threshold_water_cm: waterLevel,
-                threshold_rain_mm: rainfall,
-                sync_status: "PENDING", // ยังไม่ได้ส่ง
-                reported_at: createdAt,
-            },
-        }),
-    );
-
-    // 3. Prepare Payload for SQS
-    const eventPayload = {
-        incident_id: incidentId,
-        incident_type: "flood",
-        exact_location: areaId,
-        impact_level: impactLevel,
-        status: "Reported",
-        reported_by:
-            trigger === "SYSTEM_AUTO" ? "MonitorDisaster-Service" : trigger,
-        created_at: createdAt,
-        details: {
-            water_level_cm: waterLevel,
-            rainfall_mm: rainfall,
-            previous_status: prevStatus,
-        },
-    };
-
-    // 4. Send to AWS SQS
     try {
+        await docClient.send(
+            new PutCommand({
+                TableName: TABLE_AUDIT_LOGS,
+                Item: {
+                    logId: eventId,
+                    incident_id: incidentId,
+                    area_id: areaId,
+                    previous_status: prevStatus,
+                    new_status: currStatus,
+                    water_level_cm: waterLevel,
+                    rainfall_mm: rainfall,
+                    triggered_by: trigger,
+                    createdAt: createdAt,
+                },
+            }),
+        );
         await snsClient.send(
             new PublishCommand({
                 TopicArn: SNS_TOPIC_ARN,
-                Message: JSON.stringify(eventPayload),
-            }),
-        );
-        console.log(`\n[ASYNC EVENT] Successfully published to SNS!`);
-
-        // Update status to SUCCESS
-        await docClient.send(
-            new UpdateCommand({
-                TableName: TABLE_INCIDENT_REPORTS,
-                Key: { incident_id: incidentId },
-                UpdateExpression: "SET sync_status = :status",
-                ExpressionAttributeValues: { ":status": "SUCCESS" },
-            }),
-        );
-    } catch (error) {
-        console.error(
-            `\n[ASYNC EVENT] Failed to send SNS for ${incidentId}:`,
-            error.message,
-        );
-        // Status remains PENDING/FAILED, can be retried later
-        try {
-            await docClient.send(
-                new UpdateCommand({
-                    TableName: TABLE_INCIDENT_REPORTS,
-                    Key: { incident_id: incidentId },
-                    UpdateExpression: "SET sync_status = :status",
-                    ExpressionAttributeValues: { ":status": "FAILED" },
+                Message: JSON.stringify({
+                    event_id: eventId,
+                    timestamp: createdAt,
+                    event_type: "DisasterStatusChanged",
+                    data: {
+                        area_id: areaId,
+                        old_status: prevStatus,
+                        new_status: currStatus,
+                        incident_id: incidentId,
+                        impact_level: getImpactLevel(currStatus),
+                    },
                 }),
-            );
-        } catch (dbErr) {
-            console.error(
-                `[CRITICAL] Also failed to update DB status to FAILED:`,
-                dbErr.message,
-            );
-        }
+            }),
+        );
+    } catch (err) {
+        console.error("[EVENT PUBLISH ERROR]", err.message);
     }
 };
 
-// Background Job: Check Outdated Data (runs every 1 minute)
-setInterval(async () => {
-    try {
-        const now = new Date();
-        const response = await docClient.send(
-            new ScanCommand({ TableName: TABLE_AREAS }),
-        );
-        const areas = response.Items || [];
+// --- 4. API Routes ---
 
-        for (const area of areas) {
-            const lastUpdatedDate = new Date(area.last_updated);
-            const diffMinutes = (now - lastUpdatedDate) / (1000 * 60);
-
-            if (diffMinutes > 15 && !area.is_outdated) {
-                await docClient.send(
-                    new UpdateCommand({
-                        TableName: TABLE_AREAS,
-                        Key: { area_id: area.area_id },
-                        UpdateExpression: "SET is_outdated = :trueVal",
-                        ExpressionAttributeValues: { ":trueVal": true },
-                    }),
-                );
-                console.log(
-                    `[SYSTEM WARNING] Area ${area.area_id} data is outdated.`,
-                );
-            } else if (diffMinutes <= 15 && area.is_outdated) {
-                await docClient.send(
-                    new UpdateCommand({
-                        TableName: TABLE_AREAS,
-                        Key: { area_id: area.area_id },
-                        UpdateExpression: "SET is_outdated = :falseVal",
-                        ExpressionAttributeValues: { ":falseVal": false },
-                    }),
-                );
-            }
-        }
-    } catch (err) {
-        console.error("Background Job Error:", err.message);
-    }
-}, 60000);
-
-// API #1 [POST]: Ingest Data
-app.post("/api/monitor-disaster/ingest", async (req, res) => {
+app.post("/api/v1/monitor-disaster/ingest", apiKeyAuth, async (req, res) => {
     try {
         const {
             area_id,
             area_name,
-            source_api,
             water_level_cm,
             rainfall_mm,
             timestamp,
+            geo_location,
+            media_urls,
+            source_api,
         } = req.body;
+        const geo = geo_location || { lat: 0, lon: 0 };
+        const media = media_urls || [];
 
-        if (
-            !area_id ||
-            !source_api ||
-            !timestamp ||
-            typeof water_level_cm !== "number" ||
-            typeof rainfall_mm !== "number"
-        ) {
-            return res.status(400).json({
-                error: {
-                    code: "VALIDATION_ERROR",
-                    message: "Invalid input",
-                },
-            });
-        }
+        console.log(
+            `[API-INGEST] 📥 Received data for Area: ${area_id} from ${source_api || "Unknown"} | TraceID: ${req.traceId}`,
+        );
 
-        // Get current area
         const getRes = await docClient.send(
             new GetCommand({ TableName: TABLE_AREAS, Key: { area_id } }),
         );
-        let area = getRes.Item;
+        const currentArea = getRes.Item;
 
-        if (!area) {
-            area = {
-                disaster_status: "NORMAL",
-                is_manual_override: false,
-                last_updated: "2000-01-01",
-            };
-        } else if (new Date(timestamp) <= new Date(area.last_updated)) {
-            return res.status(200).json({
-                message: "Old data ignored",
-                updated_status: area.disaster_status,
+        if (currentArea && currentArea.last_timestamp > timestamp) {
+            console.log(
+                `[API-INGEST] ⚠️ Out-of-order data ignored for Area: ${area_id}`,
+            );
+            return res.status(409).json({
+                message: "Out-of-order data ignored",
+                traceId: req.traceId,
             });
         }
 
-        let new_status = calculateDisasterStatus(water_level_cm);
-        if (area.is_manual_override) new_status = area.disaster_status;
-        const prev_status = area.disaster_status;
+        const prev_status = currentArea
+            ? currentArea.disaster_status
+            : "NORMAL";
+        let new_status = calculateDisasterStatus(water_level_cm, rainfall_mm);
+        if (currentArea && currentArea.is_manual_override) {
+            new_status = currentArea.disaster_status;
+        }
 
-        // Upsert Area
         await docClient.send(
             new PutCommand({
                 TableName: TABLE_AREAS,
                 Item: {
                     area_id,
-                    area_name: area_name || area.area_name || `Area ${area_id}`,
                     water_level_cm,
                     rainfall_mm,
                     disaster_status: new_status,
-                    is_manual_override: area.is_manual_override,
-                    source_api,
+                    area_name:
+                        area_name || currentArea?.area_name || "Unknown Area",
+                    incident_id: currentArea?.incident_id || null,
+                    status_description: `Updated via ${source_api || "Sensor"}`,
                     is_outdated: false,
-                    last_updated: timestamp,
+                    source_api: source_api || "IOT_SENSOR_V1",
+                    is_manual_override:
+                        currentArea?.is_manual_override || false,
+                    geo_location: geo,
+                    last_timestamp: timestamp,
+                    last_updated: new Date().toISOString(),
                 },
             }),
         );
 
-        // Fire & Forget Event (No await needed here to keep API fast)
+        let sync_status = "NOT_REQUIRED";
+        const reported_at = new Date().toISOString();
+
+        if (new_status === "CRITICAL" && prev_status !== "CRITICAL") {
+            const active = await hasActiveIncident(area_id);
+            if (active) {
+                sync_status = "BYPASSED_ACTIVE_INCIDENT";
+            } else {
+                const reportSource = "IOT_SENSOR";
+                const reporterId = `sensor-${area_id.toLowerCase()}`;
+                const rawContent = `[CRITICAL] พื้นที่ ${area_id}: ระดับน้ำ ${water_level_cm}cm ปริมาณฝน ${rainfall_mm}mm`;
+
+                const tempReportId = `temp-${req.traceId}`;
+                const incidentReportItem = {
+                    report_id: tempReportId,
+                    incident_id: null,
+                    area_id,
+                    report_source: reportSource,
+                    reporter_id: reporterId,
+                    incident_type: "flood",
+                    incident_description: rawContent,
+                    impact_level: getImpactLevel(new_status),
+                    threshold_water_cm: water_level_cm,
+                    threshold_rain_mm: rainfall_mm,
+                    sync_status: "PENDING_RETRY",
+                    reported_at: reported_at,
+                    geo_location: geo,
+                    media_urls: media,
+                    idempotency_key: req.traceId,
+                    retry_count: 0,
+                    next_retry_time: Date.now(),
+                };
+
+                await docClient.send(
+                    new PutCommand({
+                        TableName: TABLE_INCIDENT_REPORTS,
+                        Item: incidentReportItem,
+                    }),
+                );
+
+                console.log(
+                    `[OUTBOUND-REPORT] 📤 POSTing CRITICAL report for Area: ${area_id} | TraceID: ${req.traceId}`,
+                );
+                try {
+                    const response = await axios.post(
+                        REPORT_SERVICE_URL,
+                        {
+                            reporter_source: reportSource,
+                            reporter_id: reporterId,
+                            raw_content: rawContent,
+                            geo_location: geo,
+                        },
+                        {
+                            timeout: 30000,
+                            headers: {
+                                "x-api-key": REPORT_API_KEY,
+                                "Content-Type": "application/json",
+                                "X-IncidentTNX-Id": req.traceId,
+                            },
+                        },
+                    );
+
+                    const realReportId = response.data.report_id;
+                    console.log(
+                        `[OUTBOUND-REPORT] ✅ Success. ReportID: ${realReportId} | TraceID: ${req.traceId}`,
+                    );
+
+                    await docClient.send(
+                        new PutCommand({
+                            TableName: TABLE_INCIDENT_REPORTS,
+                            Item: {
+                                ...incidentReportItem,
+                                report_id: realReportId,
+                                remote_trace_id: response.data.traceId || null,
+                                sync_status: "PENDING_INCIDENT",
+                            },
+                        }),
+                    );
+
+                    await docClient.send(
+                        new DeleteCommand({
+                            TableName: TABLE_INCIDENT_REPORTS,
+                            Key: { report_id: tempReportId },
+                        }),
+                    );
+
+                    sync_status = "PENDING_INCIDENT";
+                } catch (err) {
+                    console.error(
+                        `[OUTBOUND-REPORT ERROR] Deferring to CRON | TraceID: ${req.traceId} | Error: ${err.message}`,
+                    );
+                    sync_status = "PENDING_RETRY";
+                }
+            }
+        }
+
         publishEvent(
             area_id,
             prev_status,
@@ -273,19 +327,504 @@ app.post("/api/monitor-disaster/ingest", async (req, res) => {
             water_level_cm,
             rainfall_mm,
             "SYSTEM_AUTO",
+            currentArea?.incident_id,
         );
-
         res.status(200).json({
-            message: "Data ingested successfully",
             updated_status: new_status,
+            sync_status,
+            traceId: req.traceId,
         });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: err.message, traceId: req.traceId });
     }
 });
 
-// API #2 [GET]: Get Area Status
-app.get("/api/monitor-disaster/areas/:area_id", async (req, res) => {
+app.patch(
+    "/api/v1/monitor-disaster/areas/:area_id/status",
+    apiKeyAuth,
+    async (req, res) => {
+        try {
+            const { area_id } = req.params;
+            const {
+                disaster_status,
+                status_description,
+                overridden_by,
+                geo_location,
+                media_urls,
+            } = req.body;
+
+            console.log(
+                `[API-OVERRIDE] 🚨 Manual override triggered for Area: ${area_id} to ${disaster_status} by ${overridden_by} | TraceID: ${req.traceId}`,
+            );
+
+            const getRes = await docClient.send(
+                new GetCommand({ TableName: TABLE_AREAS, Key: { area_id } }),
+            );
+            const area = getRes.Item;
+            if (!area)
+                return res
+                    .status(404)
+                    .json({ error: "Area not found", traceId: req.traceId });
+
+            const geo = geo_location || area.geo_location || { lat: 0, lon: 0 };
+            const media = media_urls || [];
+
+            await docClient.send(
+                new UpdateCommand({
+                    TableName: TABLE_AREAS,
+                    Key: { area_id },
+                    UpdateExpression:
+                        "SET disaster_status = :ds, is_manual_override = :mo, last_updated = :lu, status_description = :sd, source_api = :sa",
+                    ExpressionAttributeValues: {
+                        ":ds": disaster_status,
+                        ":mo": true,
+                        ":lu": new Date().toISOString(),
+                        ":sd": status_description || "Manual Override",
+                        ":sa": "OFFICIAL_APP",
+                    },
+                }),
+            );
+
+            let sync_status = "NOT_REQUIRED";
+            if (
+                disaster_status === "CRITICAL" &&
+                area.disaster_status !== "CRITICAL"
+            ) {
+                const active = await hasActiveIncident(area_id);
+                if (!active) {
+                    const reported_at = new Date().toISOString();
+                    const reportSource = "OFFICIAL_APP";
+                    const reporterId = overridden_by || "Unknown-Dispatcher";
+                    const rawContent = `[CRITICAL] พื้นที่ ${area_id}: ${status_description}`;
+
+                    const tempReportId = `temp-${req.traceId}`;
+                    const incidentReportItem = {
+                        report_id: tempReportId,
+                        incident_id: null,
+                        area_id,
+                        report_source: reportSource,
+                        reporter_id: reporterId,
+                        incident_type: "flood",
+                        incident_description: rawContent,
+                        impact_level: getImpactLevel(disaster_status),
+                        threshold_water_cm: area.water_level_cm,
+                        threshold_rain_mm: area.rainfall_mm,
+                        sync_status: "PENDING_RETRY",
+                        reported_at: reported_at,
+                        geo_location: geo,
+                        media_urls: media,
+                        idempotency_key: req.traceId,
+                        retry_count: 0,
+                        next_retry_time: Date.now(),
+                    };
+
+                    await docClient.send(
+                        new PutCommand({
+                            TableName: TABLE_INCIDENT_REPORTS,
+                            Item: incidentReportItem,
+                        }),
+                    );
+
+                    console.log(
+                        `[OUTBOUND-REPORT] 📤 POSTing CRITICAL report for Area: ${area_id} | TraceID: ${req.traceId}`,
+                    );
+                    try {
+                        const response = await axios.post(
+                            REPORT_SERVICE_URL,
+                            {
+                                reporter_source: reportSource,
+                                reporter_id: reporterId,
+                                raw_content: rawContent,
+                                geo_location: geo,
+                            },
+                            {
+                                timeout: 30000,
+                                headers: {
+                                    "x-api-key": REPORT_API_KEY,
+                                    "Content-Type": "application/json",
+                                    "X-IncidentTNX-Id": req.traceId,
+                                },
+                            },
+                        );
+
+                        const realReportId = response.data.report_id;
+                        console.log(
+                            `[OUTBOUND-REPORT] ✅ Success. ReportID: ${realReportId} | TraceID: ${req.traceId}`,
+                        );
+
+                        await docClient.send(
+                            new PutCommand({
+                                TableName: TABLE_INCIDENT_REPORTS,
+                                Item: {
+                                    ...incidentReportItem,
+                                    report_id: realReportId,
+                                    remote_trace_id:
+                                        response.data.traceId || null,
+                                    sync_status: "PENDING_INCIDENT",
+                                },
+                            }),
+                        );
+
+                        await docClient.send(
+                            new DeleteCommand({
+                                TableName: TABLE_INCIDENT_REPORTS,
+                                Key: { report_id: tempReportId },
+                            }),
+                        );
+
+                        sync_status = "PENDING_INCIDENT";
+                    } catch (err) {
+                        console.error(
+                            `[OUTBOUND-REPORT ERROR] Deferring to CRON | TraceID: ${req.traceId} | Error: ${err.message}`,
+                        );
+                        sync_status = "PENDING_RETRY";
+                    }
+                } else {
+                    sync_status = "BYPASSED_ACTIVE_INCIDENT";
+                }
+            }
+
+            publishEvent(
+                area_id,
+                area.disaster_status,
+                disaster_status,
+                area.water_level_cm,
+                area.rainfall_mm,
+                overridden_by,
+                area.incident_id,
+            );
+            res.status(200).json({
+                message: "Status overridden",
+                sync_status,
+                traceId: req.traceId,
+            });
+        } catch (err) {
+            res.status(500).json({ error: err.message, traceId: req.traceId });
+        }
+    },
+);
+
+// Cron: Adaptive Exponential Backoff Retry Worker
+cron.schedule("*/5 * * * *", async () => {
+    try {
+        const pending = await docClient.send(
+            new ScanCommand({
+                TableName: TABLE_INCIDENT_REPORTS,
+                FilterExpression: "sync_status = :s",
+                ExpressionAttributeValues: { ":s": "PENDING_RETRY" },
+            }),
+        );
+
+        if (pending.Items && pending.Items.length > 0) {
+            console.log(
+                `\n[CRON-RETRY] ⏳ Found ${pending.Items.length} PENDING_RETRY report(s). Processing...`,
+            );
+        }
+
+        const currentTime = Date.now();
+
+        for (const report of pending.Items || []) {
+            if (report.next_retry_time && currentTime < report.next_retry_time)
+                continue;
+
+            try {
+                const response = await axios.post(
+                    REPORT_SERVICE_URL,
+                    {
+                        reporter_source: report.report_source || "IOT_SENSOR",
+                        reporter_id:
+                            report.reporter_id ||
+                            `retry-worker-${report.area_id.toLowerCase()}`,
+                        raw_content: report.incident_description,
+                        geo_location: report.geo_location || { lat: 0, lon: 0 },
+                    },
+                    {
+                        timeout: 30000,
+                        headers: {
+                            "x-api-key": REPORT_API_KEY,
+                            "Content-Type": "application/json",
+                            "X-IncidentTNX-Id": report.idempotency_key,
+                        },
+                    },
+                );
+
+                const new_id = response.data?.report_id;
+                if (new_id) {
+                    await docClient.send(
+                        new PutCommand({
+                            TableName: TABLE_INCIDENT_REPORTS,
+                            Item: {
+                                ...report,
+                                report_id: new_id,
+                                remote_trace_id: response.data.traceId || null,
+                                sync_status: "PENDING_INCIDENT",
+                            },
+                        }),
+                    );
+                    await docClient.send(
+                        new DeleteCommand({
+                            TableName: TABLE_INCIDENT_REPORTS,
+                            Key: { report_id: report.report_id },
+                        }),
+                    );
+                    console.log(
+                        `[CRON-RETRY] ✅ Successfully retried and swapped temporary ReportID to: ${new_id}`,
+                    );
+                }
+            } catch (err) {
+                const currentRetry = (report.retry_count || 0) + 1;
+                console.error(
+                    `[CRON-RETRY] ❌ Attempt ${currentRetry} failed for temp report [${report.report_id}] | Error: ${err.message}`,
+                );
+
+                if (currentRetry >= 10) {
+                    await docClient.send(
+                        new UpdateCommand({
+                            TableName: TABLE_INCIDENT_REPORTS,
+                            Key: { report_id: report.report_id },
+                            UpdateExpression:
+                                "SET sync_status = :failState, retry_count = :rc",
+                            ExpressionAttributeValues: {
+                                ":failState": "FAILED_PERMANENTLY",
+                                ":rc": currentRetry,
+                            },
+                        }),
+                    );
+                } else {
+                    const backoffMinutes = Math.pow(2, currentRetry) * 5;
+                    const nextRetry = currentTime + backoffMinutes * 60 * 1000;
+
+                    await docClient.send(
+                        new UpdateCommand({
+                            TableName: TABLE_INCIDENT_REPORTS,
+                            Key: { report_id: report.report_id },
+                            UpdateExpression:
+                                "SET retry_count = :rc, next_retry_time = :nt",
+                            ExpressionAttributeValues: {
+                                ":rc": currentRetry,
+                                ":nt": nextRetry,
+                            },
+                        }),
+                    );
+                }
+            }
+        }
+    } catch (err) {
+        console.error("[CRON-RETRY] ❌ Execution Error", err.message);
+    }
+});
+
+// --- 5. Async SQS Pollers (แยก 2 Queue) ---
+
+// Worker 1: ดึงคิวแจ้งเตือนผูกเหตุการณ์ใหม่ (INCIDENT_CREATED)
+const pollEventsQueue = async () => {
+    try {
+        const data = await sqsClient.send(
+            new ReceiveMessageCommand({
+                QueueUrl: SQS_EVENTS_QUEUE_URL,
+                MaxNumberOfMessages: 10,
+                WaitTimeSeconds: 20,
+            }),
+        );
+
+        if (data.Messages && data.Messages.length > 0) {
+            console.log(
+                `\n[SQS-EVENTS] 📥 Received ${data.Messages.length} message(s) from Events Queue.`,
+            );
+
+            for (const message of data.Messages) {
+                try {
+                    // ป้องกันการ Parsing JSON Error จาก URL Encoded ที่ถูกสร้างด้วย $util.urlEncode
+                    const decodedBody = decodeURIComponent(message.Body);
+                    const body = JSON.parse(decodedBody);
+                    const event = body.Message
+                        ? JSON.parse(body.Message)
+                        : body;
+                    const { eventType, data: evData } = event;
+
+                    console.log(
+                        `[SQS-EVENTS] 🔍 Event Type: ${eventType} | Search Report ID: [${evData?.source_report_id}] | Central Incident ID: [${evData?.incident_id}]`,
+                    );
+
+                    if (eventType === "INCIDENT_CREATED") {
+                        const rid = evData.source_report_id;
+                        if (rid && evData.incident_id) {
+                            console.log(
+                                `[SQS-EVENTS] 🔄 Trying to Update Database for Report: ${rid}...`,
+                            );
+
+                            const updReport = await docClient.send(
+                                new UpdateCommand({
+                                    TableName: TABLE_INCIDENT_REPORTS,
+                                    Key: { report_id: rid },
+                                    UpdateExpression:
+                                        "SET incident_id = :iid, sync_status = :s",
+                                    ConditionExpression:
+                                        "attribute_exists(report_id)",
+                                    ExpressionAttributeValues: {
+                                        ":iid": evData.incident_id,
+                                        ":s": "SUCCESS",
+                                    },
+                                    ReturnValues: "ALL_NEW",
+                                }),
+                            );
+
+                            if (updReport.Attributes?.area_id) {
+                                await docClient.send(
+                                    new UpdateCommand({
+                                        TableName: TABLE_AREAS,
+                                        Key: {
+                                            area_id:
+                                                updReport.Attributes.area_id,
+                                        },
+                                        UpdateExpression:
+                                            "SET incident_id = :iid",
+                                        ExpressionAttributeValues: {
+                                            ":iid": evData.incident_id,
+                                        },
+                                    }),
+                                );
+                            }
+                            console.log(
+                                `[SQS-EVENTS] ✅ Successfully linked Incident [${evData.incident_id}] to Area [${updReport.Attributes?.area_id}]`,
+                            );
+                        } else {
+                            console.warn(
+                                `[SQS-EVENTS] ⚠️ Missing required fields (source_report_id or incident_id) in Payload.`,
+                            );
+                        }
+                    }
+
+                    await sqsClient.send(
+                        new DeleteMessageCommand({
+                            QueueUrl: SQS_EVENTS_QUEUE_URL,
+                            ReceiptHandle: message.ReceiptHandle,
+                        }),
+                    );
+                    console.log(`[SQS-EVENTS] 🗑️ Message deleted from Queue.`);
+                } catch (e) {
+                    console.error("[SQS-EVENTS PROC ERROR]", e.message);
+                }
+            }
+        }
+    } catch (err) {
+        console.error("[SQS-EVENTS POLL ERROR]", err.message);
+    }
+    setTimeout(pollEventsQueue, 1000);
+};
+
+// Worker 2: ดึงคิวแจ้งอัปเดต/ปิดสถานะเหตุการณ์ (STATUS_CHANGED)
+const pollStatusQueue = async () => {
+    try {
+        const data = await sqsClient.send(
+            new ReceiveMessageCommand({
+                QueueUrl: SQS_STATUS_QUEUE_URL,
+                MaxNumberOfMessages: 10,
+                WaitTimeSeconds: 20,
+            }),
+        );
+
+        if (data.Messages && data.Messages.length > 0) {
+            console.log(
+                `\n[SQS-STATUS] 📥 Received ${data.Messages.length} message(s) from Status Queue.`,
+            );
+
+            for (const message of data.Messages) {
+                try {
+                    const decodedBody = decodeURIComponent(message.Body);
+                    const body = JSON.parse(decodedBody);
+                    const event = body.Message
+                        ? JSON.parse(body.Message)
+                        : body;
+                    const { eventType, data: evData } = event;
+
+                    console.log(
+                        `[SQS-STATUS] 🔍 Event Type: ${eventType} | Target Incident ID: [${evData?.incident_id}] | New Status: [${evData?.new_status}]`,
+                    );
+
+                    if (eventType === "STATUS_CHANGED") {
+                        if (
+                            evData.new_status === "CLOSED" ||
+                            evData.new_status === "RESOLVED"
+                        ) {
+                            console.log(
+                                `[SQS-STATUS] 🔄 Resolving Incident in Database...`,
+                            );
+
+                            const scan = await docClient.send(
+                                new ScanCommand({
+                                    TableName: TABLE_INCIDENT_REPORTS,
+                                    FilterExpression: "incident_id = :iid",
+                                    ExpressionAttributeValues: {
+                                        ":iid": evData.incident_id,
+                                    },
+                                }),
+                            );
+
+                            if (scan.Items?.length > 0) {
+                                const areaId = scan.Items[0].area_id;
+
+                                await docClient.send(
+                                    new UpdateCommand({
+                                        TableName: TABLE_INCIDENT_REPORTS,
+                                        Key: {
+                                            report_id: scan.Items[0].report_id,
+                                        },
+                                        UpdateExpression:
+                                            "SET sync_status = :s, resolved_at = :t",
+                                        ExpressionAttributeValues: {
+                                            ":s": "CLOSED",
+                                            ":t": new Date().toISOString(),
+                                        },
+                                    }),
+                                );
+
+                                await docClient.send(
+                                    new UpdateCommand({
+                                        TableName: TABLE_AREAS,
+                                        Key: { area_id: areaId },
+                                        UpdateExpression:
+                                            "SET incident_id = :n",
+                                        ExpressionAttributeValues: {
+                                            ":n": null,
+                                        },
+                                    }),
+                                );
+                                console.log(
+                                    `[SQS-STATUS] ✅ Successfully CLOSED Incident [${evData.incident_id}] and cleared Area [${areaId}]`,
+                                );
+                            } else {
+                                console.warn(
+                                    `[SQS-STATUS] ⚠️ Incident ID [${evData.incident_id}] not found in our database. Ignored.`,
+                                );
+                            }
+                        } else {
+                            console.log(
+                                `[SQS-STATUS] ℹ️ Status is ${evData.new_status}, no action required on Area table.`,
+                            );
+                        }
+                    }
+
+                    await sqsClient.send(
+                        new DeleteMessageCommand({
+                            QueueUrl: SQS_STATUS_QUEUE_URL,
+                            ReceiptHandle: message.ReceiptHandle,
+                        }),
+                    );
+                    console.log(`[SQS-STATUS] 🗑️ Message deleted from Queue.`);
+                } catch (e) {
+                    console.error("[SQS-STATUS PROC ERROR]", e.message);
+                }
+            }
+        }
+    } catch (err) {
+        console.error("[SQS-STATUS POLL ERROR]", err.message);
+    }
+    setTimeout(pollStatusQueue, 1000);
+};
+
+// --- 6. API Public & Server Start ---
+app.get("/api/v1/monitor-disaster/areas/:area_id", async (req, res) => {
     try {
         const getRes = await docClient.send(
             new GetCommand({
@@ -294,108 +833,32 @@ app.get("/api/monitor-disaster/areas/:area_id", async (req, res) => {
             }),
         );
         if (!getRes.Item)
-            return res.status(404).json({
-                error: { code: "NOT_FOUND", message: "Area not found" },
-            });
-        res.status(200).json(getRes.Item);
+            return res
+                .status(404)
+                .json({ error: "Area not found", traceId: req.traceId });
+        res.status(200).json({ ...getRes.Item, traceId: req.traceId });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: err.message, traceId: req.traceId });
     }
 });
 
-// API #4 [GET]: Get All Areas (Dashboard)
-app.get("/api/monitor-disaster/areas", async (req, res) => {
+app.get("/api/v1/monitor-disaster/areas", async (req, res) => {
     try {
         const response = await docClient.send(
             new ScanCommand({ TableName: TABLE_AREAS }),
         );
-        res.status(200).json(response.Items || []);
+        res.status(200).json({ areas: response.Items, traceId: req.traceId });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: err.message, traceId: req.traceId });
     }
 });
 
-// API #3 [PATCH]: Manually Override Status
-app.patch("/api/monitor-disaster/areas/:area_id/status", async (req, res) => {
-    try {
-        const { disaster_status, status_description, overridden_by } = req.body;
-        const { area_id } = req.params;
-        const validStatuses = ["NORMAL", "WATCH", "WARNING", "CRITICAL"];
-
-        if (
-            !validStatuses.includes(disaster_status) ||
-            !status_description ||
-            !overridden_by
-        ) {
-            return res.status(400).json({
-                error: {
-                    code: "VALIDATION_ERROR",
-                    message: "Invalid input",
-                },
-            });
-        }
-
-        const getRes = await docClient.send(
-            new GetCommand({ TableName: TABLE_AREAS, Key: { area_id } }),
-        );
-        const area = getRes.Item;
-        if (!area)
-            return res.status(404).json({
-                error: { code: "NOT_FOUND", message: "Area not found" },
-            });
-
-        await docClient.send(
-            new UpdateCommand({
-                TableName: TABLE_AREAS,
-                Key: { area_id },
-                UpdateExpression:
-                    "SET disaster_status = :ds, status_description = :sd, is_manual_override = :mo, last_updated = :lu",
-                ExpressionAttributeValues: {
-                    ":ds": disaster_status,
-                    ":sd": status_description,
-                    ":mo": true,
-                    ":lu": new Date().toISOString(),
-                },
-            }),
-        );
-
-        publishEvent(
-            area_id,
-            area.disaster_status,
-            disaster_status,
-            area.water_level_cm,
-            area.rainfall_mm,
-            overridden_by,
-        );
-        res.status(200).json({ message: "Status overridden successfully" });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// DEBUG API: Dump everything from memory
-app.get("/api/monitor-disaster/debug/db", async (req, res) => {
-    try {
-        const areas = await docClient.send(
-            new ScanCommand({ TableName: TABLE_AREAS }),
-        );
-        const logs = await docClient.send(
-            new ScanCommand({ TableName: TABLE_AUDIT_LOGS }),
-        );
-        const incidents = await docClient.send(
-            new ScanCommand({ TableName: TABLE_INCIDENT_REPORTS }),
-        );
-        res.status(200).json({
-            areas: areas.Items,
-            audit_logs: logs.Items,
-            incident_reports: incidents.Items,
-        });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
+    console.log(
+        `DisasterMonitoring (v1) Operational State Ready on port ${PORT}`,
+    );
+
+    pollEventsQueue();
+    pollStatusQueue();
 });
