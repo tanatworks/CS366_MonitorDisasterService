@@ -58,7 +58,8 @@ const TABLE_INCIDENT_REPORTS = "Disaster_IncidentReports";
 
 // --- 2. Middleware ---
 app.use((req, res, next) => {
-    req.traceId = crypto.randomUUID();
+    const awsTraceId = req.headers["x-amzn-trace-id"];
+    req.traceId = awsTraceId || crypto.randomUUID();
     res.setHeader("X-Trace-Id", req.traceId);
     next();
 });
@@ -173,12 +174,19 @@ app.post("/api/v1/monitor-disaster/ingest", apiKeyAuth, async (req, res) => {
         const geo = geo_location || { lat: 0, lon: 0 };
         const media = media_urls || [];
 
+        console.log(
+            `[API-INGEST] 📥 Received data for Area: ${area_id} from ${source_api || "Unknown"} | TraceID: ${req.traceId}`,
+        );
+
         const getRes = await docClient.send(
             new GetCommand({ TableName: TABLE_AREAS, Key: { area_id } }),
         );
         const currentArea = getRes.Item;
 
         if (currentArea && currentArea.last_timestamp > timestamp) {
+            console.log(
+                `[API-INGEST] ⚠️ Out-of-order data ignored for Area: ${area_id}`,
+            );
             return res.status(409).json({
                 message: "Out-of-order data ignored",
                 traceId: req.traceId,
@@ -256,6 +264,9 @@ app.post("/api/v1/monitor-disaster/ingest", apiKeyAuth, async (req, res) => {
                     }),
                 );
 
+                console.log(
+                    `[OUTBOUND-REPORT] 📤 POSTing CRITICAL report for Area: ${area_id} | TraceID: ${req.traceId}`,
+                );
                 try {
                     const response = await axios.post(
                         REPORT_SERVICE_URL,
@@ -276,6 +287,9 @@ app.post("/api/v1/monitor-disaster/ingest", apiKeyAuth, async (req, res) => {
                     );
 
                     const realReportId = response.data.report_id;
+                    console.log(
+                        `[OUTBOUND-REPORT] ✅ Success. ReportID: ${realReportId} | TraceID: ${req.traceId}`,
+                    );
 
                     await docClient.send(
                         new PutCommand({
@@ -299,8 +313,7 @@ app.post("/api/v1/monitor-disaster/ingest", apiKeyAuth, async (req, res) => {
                     sync_status = "PENDING_INCIDENT";
                 } catch (err) {
                     console.error(
-                        "[POST REPORT ERROR - DEFERRING TO CRON]",
-                        err.message,
+                        `[OUTBOUND-REPORT ERROR] Deferring to CRON | TraceID: ${req.traceId} | Error: ${err.message}`,
                     );
                     sync_status = "PENDING_RETRY";
                 }
@@ -339,6 +352,10 @@ app.patch(
                 geo_location,
                 media_urls,
             } = req.body;
+
+            console.log(
+                `[API-OVERRIDE] 🚨 Manual override triggered for Area: ${area_id} to ${disaster_status} by ${overridden_by} | TraceID: ${req.traceId}`,
+            );
 
             const getRes = await docClient.send(
                 new GetCommand({ TableName: TABLE_AREAS, Key: { area_id } }),
@@ -408,6 +425,9 @@ app.patch(
                         }),
                     );
 
+                    console.log(
+                        `[OUTBOUND-REPORT] 📤 POSTing CRITICAL report for Area: ${area_id} | TraceID: ${req.traceId}`,
+                    );
                     try {
                         const response = await axios.post(
                             REPORT_SERVICE_URL,
@@ -428,6 +448,9 @@ app.patch(
                         );
 
                         const realReportId = response.data.report_id;
+                        console.log(
+                            `[OUTBOUND-REPORT] ✅ Success. ReportID: ${realReportId} | TraceID: ${req.traceId}`,
+                        );
 
                         await docClient.send(
                             new PutCommand({
@@ -451,7 +474,9 @@ app.patch(
 
                         sync_status = "PENDING_INCIDENT";
                     } catch (err) {
-                        console.error("[POST REPORT ERROR]", err.message);
+                        console.error(
+                            `[OUTBOUND-REPORT ERROR] Deferring to CRON | TraceID: ${req.traceId} | Error: ${err.message}`,
+                        );
                         sync_status = "PENDING_RETRY";
                     }
                 } else {
@@ -489,6 +514,12 @@ cron.schedule("*/5 * * * *", async () => {
                 ExpressionAttributeValues: { ":s": "PENDING_RETRY" },
             }),
         );
+
+        if (pending.Items && pending.Items.length > 0) {
+            console.log(
+                `\n[CRON-RETRY] ⏳ Found ${pending.Items.length} PENDING_RETRY report(s). Processing...`,
+            );
+        }
 
         const currentTime = Date.now();
 
@@ -536,10 +567,15 @@ cron.schedule("*/5 * * * *", async () => {
                             Key: { report_id: report.report_id },
                         }),
                     );
+                    console.log(
+                        `[CRON-RETRY] ✅ Successfully retried and swapped temporary ReportID to: ${new_id}`,
+                    );
                 }
             } catch (err) {
                 const currentRetry = (report.retry_count || 0) + 1;
-                console.error(`[CRON RETRY ${currentRetry} FAIL]`, err.message);
+                console.error(
+                    `[CRON-RETRY] ❌ Attempt ${currentRetry} failed for temp report [${report.report_id}] | Error: ${err.message}`,
+                );
 
                 if (currentRetry >= 10) {
                     await docClient.send(
@@ -574,7 +610,7 @@ cron.schedule("*/5 * * * *", async () => {
             }
         }
     } catch (err) {
-        console.error("Cron Error", err.message);
+        console.error("[CRON-RETRY] ❌ Execution Error", err.message);
     }
 });
 
@@ -591,7 +627,6 @@ const pollEventsQueue = async () => {
             }),
         );
 
-        // จะ Log ก็ต่อเมื่อมีข้อความส่งมาจริงๆ เท่านั้น จะไม่ขึ้นรบกวนถ้าระบบว่างเปล่า
         if (data.Messages && data.Messages.length > 0) {
             console.log(
                 `\n[SQS-EVENTS] 📥 Received ${data.Messages.length} message(s) from Events Queue.`,
@@ -599,8 +634,9 @@ const pollEventsQueue = async () => {
 
             for (const message of data.Messages) {
                 try {
-                    // แปลงข้อความที่มาจาก API Gateway
-                    const body = JSON.parse(message.Body);
+                    // ป้องกันการ Parsing JSON Error จาก URL Encoded ที่ถูกสร้างด้วย $util.urlEncode
+                    const decodedBody = decodeURIComponent(message.Body);
+                    const body = JSON.parse(decodedBody);
                     const event = body.Message
                         ? JSON.parse(body.Message)
                         : body;
@@ -610,7 +646,6 @@ const pollEventsQueue = async () => {
                         `[SQS-EVENTS] 🔍 Event Type: ${eventType} | Search Report ID: [${evData?.source_report_id}] | Central Incident ID: [${evData?.incident_id}]`,
                     );
 
-                    // ทำงานเฉพาะ Event ประเภท INCIDENT_CREATED
                     if (eventType === "INCIDENT_CREATED") {
                         const rid = evData.source_report_id;
                         if (rid && evData.incident_id) {
@@ -618,7 +653,6 @@ const pollEventsQueue = async () => {
                                 `[SQS-EVENTS] 🔄 Trying to Update Database for Report: ${rid}...`,
                             );
 
-                            // 1. นำ incident_id ไปผูกกับ Report ID ดั้งเดิมของเราและปรับเป็น SUCCESS
                             const updReport = await docClient.send(
                                 new UpdateCommand({
                                     TableName: TABLE_INCIDENT_REPORTS,
@@ -635,7 +669,6 @@ const pollEventsQueue = async () => {
                                 }),
                             );
 
-                            // 2. อัปเดตตารางพื้นที่ (Areas) เพื่อแปะรหัส incident เข้าไป
                             if (updReport.Attributes?.area_id) {
                                 await docClient.send(
                                     new UpdateCommand({
@@ -662,7 +695,6 @@ const pollEventsQueue = async () => {
                         }
                     }
 
-                    // ลบข้อความทิ้งเมื่อประมวลผลเสร็จ
                     await sqsClient.send(
                         new DeleteMessageCommand({
                             QueueUrl: SQS_EVENTS_QUEUE_URL,
@@ -678,7 +710,6 @@ const pollEventsQueue = async () => {
     } catch (err) {
         console.error("[SQS-EVENTS POLL ERROR]", err.message);
     }
-    // วนลูปทำงานต่อไป (จะหน่วงไว้ 1 วิ หรือขึ้นกับ WaitTimeSeconds 20 วิ)
     setTimeout(pollEventsQueue, 1000);
 };
 
@@ -700,7 +731,8 @@ const pollStatusQueue = async () => {
 
             for (const message of data.Messages) {
                 try {
-                    const body = JSON.parse(message.Body);
+                    const decodedBody = decodeURIComponent(message.Body);
+                    const body = JSON.parse(decodedBody);
                     const event = body.Message
                         ? JSON.parse(body.Message)
                         : body;
@@ -710,7 +742,6 @@ const pollStatusQueue = async () => {
                         `[SQS-STATUS] 🔍 Event Type: ${eventType} | Target Incident ID: [${evData?.incident_id}] | New Status: [${evData?.new_status}]`,
                     );
 
-                    // ทำงานเฉพาะ Event ประเภท STATUS_CHANGED
                     if (eventType === "STATUS_CHANGED") {
                         if (
                             evData.new_status === "CLOSED" ||
@@ -719,7 +750,7 @@ const pollStatusQueue = async () => {
                             console.log(
                                 `[SQS-STATUS] 🔄 Resolving Incident in Database...`,
                             );
-                            // 1. ค้นหาว่าเหตุการณ์นี้ (incident_id) เกิดขึ้นในพื้นที่ใด
+
                             const scan = await docClient.send(
                                 new ScanCommand({
                                     TableName: TABLE_INCIDENT_REPORTS,
@@ -733,7 +764,6 @@ const pollStatusQueue = async () => {
                             if (scan.Items?.length > 0) {
                                 const areaId = scan.Items[0].area_id;
 
-                                // 2. ปิดจ็อบที่ตาราง Report (ปรับสถานะเป็น CLOSED)
                                 await docClient.send(
                                     new UpdateCommand({
                                         TableName: TABLE_INCIDENT_REPORTS,
@@ -749,7 +779,6 @@ const pollStatusQueue = async () => {
                                     }),
                                 );
 
-                                // 3. เคลียร์ค่า incident_id ในพื้นที่เกิดเหตุกลับเป็น Null
                                 await docClient.send(
                                     new UpdateCommand({
                                         TableName: TABLE_AREAS,
@@ -776,14 +805,13 @@ const pollStatusQueue = async () => {
                         }
                     }
 
-                    // ลบข้อความทิ้งเมื่อประมวลผลเสร็จ
                     await sqsClient.send(
                         new DeleteMessageCommand({
                             QueueUrl: SQS_STATUS_QUEUE_URL,
                             ReceiptHandle: message.ReceiptHandle,
                         }),
                     );
-                    console.log(`[SQS-STATUS] Message deleted from Queue.`);
+                    console.log(`[SQS-STATUS] 🗑️ Message deleted from Queue.`);
                 } catch (e) {
                     console.error("[SQS-STATUS PROC ERROR]", e.message);
                 }
@@ -792,7 +820,6 @@ const pollStatusQueue = async () => {
     } catch (err) {
         console.error("[SQS-STATUS POLL ERROR]", err.message);
     }
-    // วนลูปทำงานต่อไป
     setTimeout(pollStatusQueue, 1000);
 };
 
