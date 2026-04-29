@@ -36,7 +36,6 @@ const SNS_TOPIC_ARN =
     process.env.SNS_TOPIC_ARN ||
     "arn:aws:sns:us-east-1:462632273029:MonitoringDisaster-Topic";
 
-// ⚠️ แยก Queue URL ออกเป็น 2 ตัวตาม Architecture ใหม่
 const SQS_EVENTS_QUEUE_URL =
     process.env.SQS_EVENTS_QUEUE_URL ||
     "https://sqs.us-east-1.amazonaws.com/462632273029/monitor-disaster-events-queue";
@@ -229,7 +228,6 @@ app.post("/api/v1/monitor-disaster/ingest", apiKeyAuth, async (req, res) => {
                 const reporterId = `sensor-${area_id.toLowerCase()}`;
                 const rawContent = `[CRITICAL] พื้นที่ ${area_id}: ระดับน้ำ ${water_level_cm}cm ปริมาณฝน ${rainfall_mm}mm`;
 
-                // Transactional Outbox: Persist State ก่อนยิง API
                 const tempReportId = `temp-${req.traceId}`;
                 const incidentReportItem = {
                     report_id: tempReportId,
@@ -593,7 +591,12 @@ const pollEventsQueue = async () => {
             }),
         );
 
-        if (data.Messages) {
+        // จะ Log ก็ต่อเมื่อมีข้อความส่งมาจริงๆ เท่านั้น จะไม่ขึ้นรบกวนถ้าระบบว่างเปล่า
+        if (data.Messages && data.Messages.length > 0) {
+            console.log(
+                `\n[SQS-EVENTS] 📥 Received ${data.Messages.length} message(s) from Events Queue.`,
+            );
+
             for (const message of data.Messages) {
                 try {
                     // แปลงข้อความที่มาจาก API Gateway
@@ -601,13 +604,20 @@ const pollEventsQueue = async () => {
                     const event = body.Message
                         ? JSON.parse(body.Message)
                         : body;
-
                     const { eventType, data: evData } = event;
+
+                    console.log(
+                        `[SQS-EVENTS] 🔍 Event Type: ${eventType} | Search Report ID: [${evData?.source_report_id}] | Central Incident ID: [${evData?.incident_id}]`,
+                    );
 
                     // ทำงานเฉพาะ Event ประเภท INCIDENT_CREATED
                     if (eventType === "INCIDENT_CREATED") {
                         const rid = evData.source_report_id;
                         if (rid && evData.incident_id) {
+                            console.log(
+                                `[SQS-EVENTS] 🔄 Trying to Update Database for Report: ${rid}...`,
+                            );
+
                             // 1. นำ incident_id ไปผูกกับ Report ID ดั้งเดิมของเราและปรับเป็น SUCCESS
                             const updReport = await docClient.send(
                                 new UpdateCommand({
@@ -643,7 +653,11 @@ const pollEventsQueue = async () => {
                                 );
                             }
                             console.log(
-                                `[SQS-EVENTS] Linked Incident ${evData.incident_id} successfully.`,
+                                `[SQS-EVENTS] ✅ Successfully linked Incident [${evData.incident_id}] to Area [${updReport.Attributes?.area_id}]`,
+                            );
+                        } else {
+                            console.warn(
+                                `[SQS-EVENTS] ⚠️ Missing required fields (source_report_id or incident_id) in Payload.`,
                             );
                         }
                     }
@@ -655,6 +669,7 @@ const pollEventsQueue = async () => {
                             ReceiptHandle: message.ReceiptHandle,
                         }),
                     );
+                    console.log(`[SQS-EVENTS] 🗑️ Message deleted from Queue.`);
                 } catch (e) {
                     console.error("[SQS-EVENTS PROC ERROR]", e.message);
                 }
@@ -663,7 +678,7 @@ const pollEventsQueue = async () => {
     } catch (err) {
         console.error("[SQS-EVENTS POLL ERROR]", err.message);
     }
-    // วนลูปทำงานต่อไป
+    // วนลูปทำงานต่อไป (จะหน่วงไว้ 1 วิ หรือขึ้นกับ WaitTimeSeconds 20 วิ)
     setTimeout(pollEventsQueue, 1000);
 };
 
@@ -678,15 +693,22 @@ const pollStatusQueue = async () => {
             }),
         );
 
-        if (data.Messages) {
+        if (data.Messages && data.Messages.length > 0) {
+            console.log(
+                `\n[SQS-STATUS] 📥 Received ${data.Messages.length} message(s) from Status Queue.`,
+            );
+
             for (const message of data.Messages) {
                 try {
                     const body = JSON.parse(message.Body);
                     const event = body.Message
                         ? JSON.parse(body.Message)
                         : body;
-
                     const { eventType, data: evData } = event;
+
+                    console.log(
+                        `[SQS-STATUS] 🔍 Event Type: ${eventType} | Target Incident ID: [${evData?.incident_id}] | New Status: [${evData?.new_status}]`,
+                    );
 
                     // ทำงานเฉพาะ Event ประเภท STATUS_CHANGED
                     if (eventType === "STATUS_CHANGED") {
@@ -694,6 +716,9 @@ const pollStatusQueue = async () => {
                             evData.new_status === "CLOSED" ||
                             evData.new_status === "RESOLVED"
                         ) {
+                            console.log(
+                                `[SQS-STATUS] 🔄 Resolving Incident in Database...`,
+                            );
                             // 1. ค้นหาว่าเหตุการณ์นี้ (incident_id) เกิดขึ้นในพื้นที่ใด
                             const scan = await docClient.send(
                                 new ScanCommand({
@@ -737,9 +762,17 @@ const pollStatusQueue = async () => {
                                     }),
                                 );
                                 console.log(
-                                    `[SQS-STATUS] Closed Incident ${evData.incident_id} safely.`,
+                                    `[SQS-STATUS] ✅ Successfully CLOSED Incident [${evData.incident_id}] and cleared Area [${areaId}]`,
+                                );
+                            } else {
+                                console.warn(
+                                    `[SQS-STATUS] ⚠️ Incident ID [${evData.incident_id}] not found in our database. Ignored.`,
                                 );
                             }
+                        } else {
+                            console.log(
+                                `[SQS-STATUS] ℹ️ Status is ${evData.new_status}, no action required on Area table.`,
+                            );
                         }
                     }
 
@@ -750,6 +783,7 @@ const pollStatusQueue = async () => {
                             ReceiptHandle: message.ReceiptHandle,
                         }),
                     );
+                    console.log(`[SQS-STATUS] Message deleted from Queue.`);
                 } catch (e) {
                     console.error("[SQS-STATUS PROC ERROR]", e.message);
                 }
