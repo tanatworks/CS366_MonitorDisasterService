@@ -1,214 +1,41 @@
 # CS366_MonitorDisasterService
 
-MonitoringDisaster Service เป็นระบบต้นน้ำที่ทำหน้าที่รับข้อมูลสภาพแวดล้อม (Ingestion) แบบ Real-time เช่น ระดับน้ำ และปริมาณน้ำฝน เพื่อประเมินความรุนแรงของสถานการณ์ภัยพิบัติในแต่ละพื้นที่ พร้อมทั้งกระจายข่าวสารในรูปแบบ Asynchronous Events ไปยังระบบอื่น ๆ ที่เกี่ยวข้อง เพื่อเตรียมการรับมือได้อย่างทันท่วงที
-
 ## Service Owner
 นาย ธนัช เกิดทิพย์ รหัสนักศึกษา 6609611980 ภาคปกติ
 
-## System Architecture
-**Main components:**
-* **AWS Application Load Balancer (ALB)** – ทำหน้าที่เป็นประตูหน้าบ้าน (Entry Point) และกระจายทราฟฟิกไปยังระบบเบื้องหลัง
-* **Amazon ECS (Fargate)** – รันบริการ Microservice ในรูปแบบ Containerized Node.js Application
-* **Amazon DynamoDB** – จัดเก็บข้อมูลสถานะพื้นที่ (Areas), บันทึกประวัติ (Audit Logs) และรายการอุบัติการณ์ (Incident Reports)
-* **Amazon SNS** – ทำหน้าที่เป็น Message Broker สำหรับกระจายข่าวสารแบบ Pub/Sub (Fan-out) ไปยัง Service ของเพื่อนคนอื่น ๆ
-
-## API Endpoints
-
-| Method    | Endpoint                                      | คำอธิบายการทำงาน                                                                                    |
-| :-------- | :-------------------------------------------- | :-------------------------------------------------------------------------------------------------- |
-| **POST**  | `/api/monitor-disaster/ingest`                | รับข้อมูลจากเซนเซอร์ (ระดับน้ำ, ปริมาณฝน) และประเมินสถานะภัยพิบัติอัตโนมัติ                         |
-| **GET**   | `/api/monitor-disaster/areas/:area_id`        | ดึงข้อมูลและสถานะล่าสุดของพื้นที่ที่ระบุ                                                            |
-| **GET**   | `/api/monitor-disaster/areas`                 | ดึงข้อมูลสถานะของทุกพื้นที่ในระบบ (สำหรับทำหน้า Dashboard)                                          |
-| **GET**   | `/api/monitor-disaster/debug/db`              | ตรวจสอบข้อมูลดิบใน In-memory Database และประวัติ Event ทั้งหมด                                      |
-| **PATCH** | `/api/monitor-disaster/areas/:area_id/status` | บังคับเปลี่ยนสถานะโดยเจ้าหน้าที่ (Manual Override) ระบบจะล็อคสถานะไว้และเพิกเฉยต่อข้อมูลจากเซนเซอร์ |
+## 1. Project Overview (ภาพรวมระบบ)
+MonitoringDisaster Service เป็นระบบต้นน้ำที่ทำหน้าที่รับข้อมูลสภาพแวดล้อม (Ingestion) แบบ Real-time เช่น ระดับน้ำ และปริมาณน้ำฝน เพื่อประเมินความรุนแรงของสถานการณ์ภัยพิบัติในแต่ละพื้นที่ พร้อมทั้งกระจายข่าวสารในรูปแบบ Asynchronous Events ไปยังระบบอื่น ๆ ที่เกี่ยวข้อง เพื่อเตรียมการรับมือได้อย่างทันท่วงที
 
 
-**Base URL:** `http://monitor-disaster-alb-1866264118.us-east-1.elb.amazonaws.com`
+## 2. Architecture & Infrastructure (สถาปัตยกรรมและโครงสร้างพื้นฐาน)
+สถาปัตยกรรมถูกออกแบบภายใต้หลักการ Decoupling และ High Availability โดยใช้ทรัพยากรบน AWS ดังนี้:
+- Entry Point: Amazon API Gateway ทำหน้าที่เป็นช่องทางรับ Request แบบรวมศูนย์ ทั้งจากการเรียก API สากลและการรับ Webhook
+- Compute Layer: Amazon ECS (Fargate) ประกอบด้วย Worker 3 ส่วน ได้แก่ Main API Task (ประมวลผล Ingress/Egress หลัก), Events SQS Poller และ Status SQS Poller
+- Storage Layer: Amazon DynamoDB ฐานข้อมูล NoSQL สำหรับจัดเก็บสถานะพื้นที่ (Areas), ประวัติการทำงาน (AuditLogs), และประวัติการประเมินเหตุการณ์ (IncidentReports)
+- Message Broker: Amazon SQS (รองรับ Inbound Webhook ข้ามคลาวด์) และ Amazon SNS (รองรับ Outbound Publish-Subscribe)
 
-### API Contract 1: Ingest Environmental Data
-**POST** `/api/monitor-disaster/ingest`
+## 3. Core Capabilities & System Features (คุณสมบัติหลักของระบบ)
 
-ใช้สำหรับรับข้อมูลจากเซนเซอร์เพื่อประเมินสถานะภัยพิบัติ หากระดับน้ำถึงเกณฑ์วิกฤต ระบบจะบันทึกข้อมูลและ Publish Event ไปยัง SNS โดยอัตโนมัติ
+* Hybrid Interaction Flow:
+  - Downstream (Sync): เมื่อสถานะวิกฤต จะยิง HTTP POST ออกไปยัง Report Ingestion Service ทันที
+  - Upstream (Async Pull): Background Workers ทำการ Long Polling จากคิว `events-queue` และ `status-queue` เพื่อรอรับ Webhook ตั๋วเหตุการณ์จาก GCP
+  - Downstream (Async Push): กระจาย Event แจ้งระดับความรุนแรงพื้นที่ (Impact Level) ออกไปยังปลายทางผ่าน Amazon SNS แบบ Fire-and-Forget
+* Resiliency & Failure Handling (Outbox Pattern):
+  - หากการส่งข้อมูลข้ามบริการล้มเหลว (เช่น Timeout) ระบบจะจัดการผ่าน Local Database โดยตั้งสถานะเป็น `PENDING_RETRY`
+  - Cron Job จะทำงานทุก 5 นาทีโดยใช้กลไก Adaptive Exponential Backoff เพื่อดึงข้อมูลมายิงซ้ำและทำ ID Swapping เมื่อสำเร็จ โดยไม่ทำให้กระบวนการหลักสะดุด
+* Data Integrity & Idempotency:
+  - ป้องกันการประมวลผลข้อมูลเก่าหรือผิดลำดับ (Out-of-order) ด้วยการทวนสอบ `last_timestamp` (หากเก่ากว่าระบบจะตอบกลับ HTTP 409 Conflict)
+  - ใช้ `req.traceId` (หรือ `X-Amzn-Trace-Id`) ตลอดทั้ง Transaction เพื่อรักษา Correlation ข้าม Microservices
+* Concurrency Control:
+  - ล็อคความสำคัญของสถานะทันทีเมื่อเข้าสู่โหมด Manual (`is_manual_override: true`)
 
-**Example request:**
-```json
-{
-    "area_id": "TH-BKK-001",
-    "area_name": "Bangkok - Don Mueang",
-    "source_api": "RID-API",
-    "water_level_cm": 120.5,
-    "rainfall_mm": 80.0,
-    "timestamp": "2026-03-08T15:05:00Z"
-}
-```
+## 4. API Endpoints (v1)
 
-**Example response:**
-- **Status:** 200 OK
+ระบบบังคับใช้มาตรการความปลอดภัยด้วย Header `X-Api-Key` ในทุก Request
 
-- **Response Body:**
-```json
-{
-    "message": "Data ingested successfully",
-    "updated_status": "WARNING"
-}
-```
-
-### API Contract 2: Get Area Status by ID
-**GET** `/api/monitor-disaster/areas/{area_id}`
-
-ใช้ดึงข้อมูลรายละเอียดและสถานะภัยพิบัติล่าสุดของพื้นที่ที่ระบุ
-
-**Example response:**
-- **Status:** 200 OK
-
-- **Response Body:**
-```json
-{
-    "area_id": "TH-BKK-001",
-    "area_name": "Bangkok - Don Mueang",
-    "water_level_cm": 120.5,
-    "rainfall_mm": 80.0,
-    "disaster_status": "WARNING",
-    "is_manual_override": false,
-    "source_api": "RID-API",
-    "is_outdated": false,
-    "last_updated": "2026-03-08T15:05:00Z"
-}
-```
-
-### API Contract 3: List All Areas (Dashboard)
-**GET** `/api/monitor-disaster/areas`
-
-ใช้สำหรับดึงรายการพื้นที่ทั้งหมดในระบบ เพื่อนำไปแสดงผลบน Dashboard
-
-**Example response:**
-- **Status:** 200 OK
-
-- **Response Body:**
-```json
-[
-    {
-        "area_id": "TH-BKK-001",
-        "area_name": "Bangkok - Don Mueang",
-        "disaster_status": "WARNING",
-        "water_level_cm": 120.5,
-        "is_outdated": false,
-        "last_updated": "2026-03-08T15:05:00Z"
-    },
-    {
-        "area_id": "TH-BKK-002",
-        "area_name": "Bangkok - Lak Si",
-        "disaster_status": "NORMAL",
-        "water_level_cm": 45.0,
-        "is_outdated": true,
-        "last_updated": "2026-03-08T10:00:00Z"
-    }
-]
-```
-
-### API Contract 4: Debug Database 
-**GET** `/api/monitor-disaster/debug/db`
-
-ดึงข้อมูลดิบทั้งหมดจาก DynamoDB (Areas, Audit Logs, Incident Reports) เพื่อตรวจสอบความถูกต้องของระบบ
-
-**Example response:**
-- **Status:** 200 OK
-
-- **Response Body:**
-```json
-{
-    "areas": [ /* ข้อมูลพื้นที่ทั้งหมด */ ],
-    "audit_logs": [
-        {
-            "logId": "a1b2c3d4...",
-            "area_id": "TH-BKK-001",
-            "previous_status": "NORMAL",
-            "new_status": "WARNING",
-            "triggered_by": "SYSTEM_AUTO",
-            "createdAt": "2026-03-08T15:05:00Z"
-        }
-    ],
-    "incident_reports": [
-        {
-            "incident_id": "uuid-123",
-            "sync_status": "SUCCESS",
-            "impact_level": 3,
-            "reported_at": "2026-03-08T15:05:00Z"
-        }
-    ]
-}
-```
-
-### API Contract 5: Manual Status Override
-**PATCH** `/api/monitor-disaster/areas/{area_id}/status`
-
-ใช้สำหรับให้เจ้าหน้าที่ (Dispatcher) บังคับเปลี่ยนสถานะพื้นที่ด้วยตนเองในกรณีฉุกเฉิน ซึ่งระบบจะล็อคสถานะไว้และเพิกเฉยต่อข้อมูลจากเซนเซอร์ชั่วคราว
-
-**Example request:**
-```json
-{
-    "disaster_status": "CRITICAL",
-    "status_description": "Evacuation needed immediately",
-    "overridden_by": "dispatcher_tanat"
-}
-```
-**Example response:**
-- **Status:** 200 OK
-
-- **Response Body:**
-```json
-{
-    "message": "Status overridden successfully"
-}
-```
-
-## Event Flow
-
-```
-1. ข้อมูลเซ็นเซอร์ (จำลองยิงผ่าน Postman)
-       │
-       ▼
-2. AWS ALB (Application Load Balancer)
-       │   
-       ▼
-3. Amazon ECS Fargate (Node.js Microservice)
-       │   
-       │
-       ├──▶ 4. Amazon DynamoDB (NoSQL Database)
-       │    
-       │        
-       ▼
-5. Amazon SNS (Simple Notification Service)
-       │   - (Publisher) เมื่อน้ำท่วม ระบบเราจะตะโกนแจ้งเตือนผ่านช่องทางนี้แค่ "ครั้งเดียว"
-       │
-       ├──▶ 6. Amazon SQS ของเพื่อน A 
-       │    
-       │
-       └──▶ 7. Amazon SQS ของเพื่อน B
-```
-
-## Dependencies & Mocking
-
-โปรเจกต์นี้เป็น **Upstream Service (ระบบต้นน้ำ)** ที่ทำหน้าที่สร้างข้อมูลและกระจายข่าวสาร (Publisher) ให้กับ Service อื่นๆ จึงมีจุดที่มีการทำงานร่วมกับระบบอื่นและได้ทำการ Mock ไว้เพื่อการสาธิต (Demo) ดังนี้:
-
-**1. การ Mock ข้อมูลขาเข้า (Input Mocking)**
-* **สิ่งที่ Mock:** ข้อมูลสภาพแวดล้อมจากเซนเซอร์ IoT (เช่น ระดับน้ำ, ปริมาณฝน)
-* **วิธีการ Mock:** ใช้ **Postman** ทำการส่ง HTTP POST Request เข้ามาที่ API `/api/monitor-disaster/ingest` โดยจำลอง Payload เสมือนว่าเป็นการส่งข้อมูลมาจริงๆ (อ้างอิงโครงสร้าง JSON ตาม API Contract 1)
-
-**2. การ Mock ข้อมูลขาออก / Dependency กับ Service เพื่อน (Output Mocking)**
-* **Dependency:** Service ของเพื่อนๆ ที่ลงชื่อเป็น Potential Users (เช่น ระบบจัดการอพยพ, ระบบแผนที่เลี่ยงภัยพิบัติ) จะต้องมารับ Event แจ้งเตือนภัยพิบัติจากระบบนี้ผ่าน **Amazon SNS**
-* **API Contract ที่ใช้อ้างอิง:** โครงสร้าง Payload ของ Event อ้างอิงตามไฟล์เอกสาร `docs/async-contract.md`
-* **วิธีการ Mock:** เนื่องจากในการสาธิตอาจจะยังไม่ได้เชื่อมต่อกับระบบของเพื่อนแบบ End-to-End จึงได้ทำการจำลอง (Mock) โดยสร้าง **Amazon SQS Queue ชั่วคราว** ขึ้นมา 1 ตัว และทำการ Subscribe เข้ากับ SNS Topic ของระบบ เพื่อใช้แสดงผลให้เห็นว่าเมื่อเกิดภัยพิบัติ ระบบสามารถ Publish Asynchronous Event ออกมาได้สำเร็จ และ Payload มีข้อมูลครบถ้วนตาม Contract จริง
-
-## System Features
-
-- **Concurrency Control:** ล็อคสถานะของระบบทันทีเมื่อมีการสั่งการด้วยโหมด Manual (is_manual_override: true)
-- **Idempotency:** ป้องกันข้อมูลเซนเซอร์ที่เก่ากว่าหรือซ้ำซ้อนมาเขียนทับข้อมูลปัจจุบัน โดยตรวจสอบจาก Timestamp
-- **Resiliency Job:** มีระบบทำงานเบื้องหลังเพื่อตรวจจับข้อมูลขาดการติดต่อ หากเกิน 15 นาที ระบบจะปรับสถานะเป็น is_outdated: true โดยอัตโนมัติ
-
-## Technologies Used
-- **Backend:** Node.js (Express)
-- **Cloud Infrastructure:** AWS ECS Fargate, ALB
-- **Database:** Amazon DynamoDB
-- **Messaging System:** Amazon SNS
-- **Containerization:** Docker
+| Method | Endpoint | คำอธิบายการทำงาน |
+| :--- | :--- | :--- |
+| **POST** | `/api/v1/monitor-disaster/ingest` | รับข้อมูลเซนเซอร์เรียลไทม์ ประเมินสถานะอัตโนมัติ หากสถานะเป็น **CRITICAL** จะทริกเกอร์การเปิดรายงานแบบ Non-blocking |
+| **GET** | `/api/v1/monitor-disaster/areas` | ดึงข้อมูลภาพรวมสถานะทุกพื้นที่แบบ Synchronous (สำหรับ Dashboard) |
+| **GET** | `/api/v1/monitor-disaster/areas/:area_id` | ดึงข้อมูลและสถานะล่าสุดเจาะจงรายพื้นที่ |
+| **PATCH** | `/api/v1/monitor-disaster/areas/:area_id/status` | บังคับเปลี่ยนสถานะโดยเจ้าหน้าที่ (**Manual Override**) ระบบจะเพิกเฉยข้อมูลเซนเซอร์จนกว่าจะมีการปลดล็อค |
