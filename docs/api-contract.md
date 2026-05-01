@@ -2,14 +2,6 @@
 
 Base URL: `https://p4j0q5vplh.execute-api.us-east-1.amazonaws.com`
 
-## Authentication
-
-Protected routes require the following header:
-
-| Header      | Value              | Description                        |
-| :---------- | :----------------- | :--------------------------------- |
-| `X-Api-Key` | `disaster-monitoring-9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6` | API Key for service authentication |
-
 ---
 
 ## 1. Ingest External Data
