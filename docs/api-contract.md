@@ -18,17 +18,18 @@ Base URL: `https://p4j0q5vplh.execute-api.us-east-1.amazonaws.com`
 **Headers**
 ```
 Content-Type: application/json
-x-api-key: <sensor_secret_key>
+X-Api-Key: <sensor_secret_key>
 ```
 
 **Request Body Schema:**
 - `area_id` (String, Required): รหัสพื้นที่
-- `area_name` (String, Required): ชื่อพื้นที่
-- `source_api` (String, Required): แหล่งที่มาของข้อมูล
+- `area_name` (String, Optional): ชื่อพื้นที่
+- `source_api` (String, Required): แหล่งที่มาของข้อมูล (เช่น IOT_SENSOR_V1)
 - `water_level_cm` (Number, Required, ≥ 0): ระดับน้ำ (เซนติเมตร)
 - `rainfall_mm` (Number, Required, ≥ 0): ปริมาณน้ำฝน (มิลลิเมตร)
 - `timestamp` (Number, Required): Unix timestamp จากเซ็นเซอร์
-- `geo_location` (Object, Required): พิกัด `{ "lat": Number, "lon": Number }`
+- `geo_location` (Object, Optional): พิกัด `{ "lat": Number, "lon": Number }`
+- `media_urls` (Array, Optional): รายการ URL รูปภาพหรือวิดีโอ
 
 **Response Headers**
 - `X-Trace-Id`: `<uuid>`
@@ -53,7 +54,7 @@ x-api-key: <sensor_secret_key>
 }
 ```
 
-- **Success (200 OK):** กรณีข้อมูลเก่า ไม่บันทึกซ้ำ (Out-of-order message)
+- **Error (409 Conflict):** กรณีข้อมูลเก่า ไม่บันทึกซ้ำ (Out-of-order message)
 ```json
 {
   "message": "Out-of-order data ignored",
@@ -72,15 +73,15 @@ x-api-key: <sensor_secret_key>
 - **Error (500 Internal Server Error):**
 ```json
 {
-  "error": "...",
+  "error": "Cannot read properties of undefined (reading 'lat')",
   "traceId": "<uuid>"
 }
 ```
 
 **Dependency / Reliability**
-- **Outbound Call:** เมื่อระบบประเมินสถานะเข้าสู่เกณฑ์ CRITICAL จะเรียกใช้งาน `POST /v1/reports` ของ Report Ingestion & Verification Service (`https://d8a7ds12a2.execute-api.us-east-1.amazonaws.com/dev/v1/reports`)
+- **Outbound Call:** เมื่อระบบประเมินสถานะเข้าสู่เกณฑ์ CRITICAL จะเรียกใช้งาน `POST /v1/reports` ของ Report Ingestion & Verification Service
 - **Explicit Timeout:** บังคับตั้งค่าการรอคอยสูงสุด (Timeout) ขาออกที่ 30 วินาที
-- **Reliability:** หากเรียก Service ภายนอกล้มเหลว ระบบจะบันทึกข้อมูลลงตาราง `Disaster_IncidentReports` ด้วยสถานะ `PENDING_RETRY` และให้ Cron Job ทำการ Retry (Exponential Backoff) ทุกๆ 5 นาที
+- **Reliability:** หากเรียก Service ภายนอกล้มเหลว ระบบจะบันทึกข้อมูลลงตาราง `Disaster_IncidentReports` ด้วยสถานะ `PENDING_RETRY` และให้ Cron Job ทำการ Retry (Adaptive Exponential Backoff) ทุกๆ 5 นาที (สูงสุด 10 ครั้ง)
 - **Idempotency:** ส่งค่า Trace ID ไปใน Header `X-IncidentTNX-Id` ไปยังปลายทางเพื่อป้องกันการเปิดตั๋วเหตุการณ์ซ้ำซ้อน
 
 ---
@@ -160,6 +161,8 @@ Content-Type: application/json
 - `disaster_status` (String, Required): ต้องอยู่ใน [NORMAL, WATCH, WARNING, CRITICAL]
 - `status_description` (String, Required): เหตุผลการเปลี่ยนสถานะ
 - `overridden_by` (String, Required): รหัสเจ้าหน้าที่
+- `geo_location` (Object, Optional): พิกัด `{ "lat": Number, "lon": Number }`
+- `media_urls` (Array, Optional): รายการ URL รูปภาพหรือวิดีโอ
 
 **Response Headers**
 - `X-Trace-Id`: `<uuid>`
@@ -183,10 +186,18 @@ Content-Type: application/json
 }
 ```
 
+- **Error (500 Internal Server Error):**
+```json
+{
+  "error": "One or more parameter values were invalid...",
+  "traceId": "<uuid>"
+}
+```
+
 **Dependency / Reliability**
-- **Outbound Call:** หากปรับเป็น CRITICAL จะเรียกใช้ `POST /v1/reports` เพื่อเปิดเหตุการณ์ฉุกเฉิน (`https://d8a7ds12a2.execute-api.us-east-1.amazonaws.com/dev/v1/reports`)
-- **Reliability:** ทำงานคู่กับ Outbox Pattern หากเพื่อนล่ม จะ Mark เป็น `PENDING_RETRY`
-- **Concurrency Control:** เมื่ออัปเดตสำเร็จ จะปรับค่า `is_manual_override = true` เพื่อป้องกัน Sensor เขียนทับ
+- **Outbound Call:** หากปรับเป็น CRITICAL จะเรียกใช้ `POST /v1/reports` เพื่อเปิดเหตุการณ์ฉุกเฉิน
+- **Reliability:** ทำงานคู่กับ Local Outbox Pattern หากระบบปลายทางล่ม จะ Mark เป็น `PENDING_RETRY`
+- **Concurrency Control:** เมื่ออัปเดตสำเร็จ จะปรับค่า `is_manual_override = true` เพื่อป้องกัน Sensor เขียนทับการตัดสินใจของเจ้าหน้าที่
 
 ---
 
@@ -223,6 +234,11 @@ Accept: application/json
 }
 ```
 
+**Dependency / Reliability**
+- ไม่เรียก service อื่น
+- Idempotent (Read-only)
+- Timeout: 30s
+
 ---
 
 ## 5. Get Area Historical Trends
@@ -256,3 +272,20 @@ Accept: application/json
   ]
 }
 ```
+
+- **Error (404 Not Found):**
+```json
+{
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "Area ID not found or no history available",
+    "traceId": "<uuid>"
+  }
+}
+```
+
+**Dependency / Reliability**
+- ไม่เรียก service อื่น
+- Idempotent (Read-only)
+- คิวรีข้อมูลจาก DynamoDB (ตาราง Disaster_AuditLogs โดยใช้ area_id เป็น Index และเรียงลำดับตามเวลา)
+- Timeout: 30s
