@@ -21,7 +21,7 @@
 | source_api | string | Y | รหัส API หรือแหล่งต้นทางที่ส่งข้อมูลมาให้ | IOT_SENSOR_V1 |
 | is_manual_override | boolean | Y | true ถ้าระบุโดย Dispatcher (กันเซ็นเซอร์เขียนทับ) | false |
 | last_timestamp | number | Y | Unix timestamp จากเซ็นเซอร์ ป้องกันข้อมูล Out-of-order | 1708560000000 |
-| last_updated | datetime | Y | เวลาที่ข้อมูลแถวนี้มีการแก้ไขล่าสุดในระบบ | 2026-02-21T10:00:00Z |
+| last_updated | datetime | Y | เวลาที่ข้อมูลแถวนี้มีการแก้ไขล่าสุดในระบบ (ISO-8601) | 2026-02-21T10:00:00Z |
 
 ---
 
@@ -38,16 +38,16 @@
 | water_level_cm | float | Y | ระดับน้ำ ณ เวลาที่บันทึกประวัตินี้ | 120.50 |
 | rainfall_mm | float | Y | ปริมาณน้ำฝน ณ เวลาที่บันทึกประวัตินี้ | 185.20 |
 | triggered_by | string | Y | รหัสผู้สั่งเปลี่ยน (Dispatcher) หรือ "SYSTEM_AUTO" | SYSTEM_AUTO |
-| createdAt | datetime | Y | เวลาที่เกิดการเปลี่ยนแปลงสถานะ | 2026-02-21T10:00:00Z |
+| createdAt | datetime | Y | เวลาที่เกิดการเปลี่ยนแปลงสถานะ (ISO-8601) | 2026-02-21T10:00:00Z |
 
 ---
 
 ## 3. Incident Reports / Outbox (ตาราง `Disaster_IncidentReports`)
-ตารางจัดการสถานะการยิง API ไปหาส่วนกลาง ทำหน้าที่เป็น Transactional Outbox รองรับระบบ Retry เมื่อ Network ขัดข้อง และรอจับคู่รหัสผ่าน SQS
+ตารางจัดการสถานะการยิง API ไปหาส่วนกลาง ทำหน้าที่เป็น Transactional Outbox รองรับระบบ Retry (Adaptive Exponential Backoff) และรอจับคู่รหัสผ่าน SQS
 
 | Field Name | Type | Required | Description | Example |
 | :--- | :--- | :--- | :--- | :--- |
-| **report_id** | string | Y (PK) | รหัสอ้างอิงของ Report (Local ID) เพื่อรอเปลี่ยนเป็นของจริง | temp-uuid หรือ r-12345 |
+| **report_id** | string | Y (PK) | รหัสอ้างอิงของ Report (Local ID หรือ Central Report ID) | temp-uuid หรือ r-12345 |
 | incident_id | uuid | N | รหัส Incident อ้างอิงระบบส่วนกลาง (Global ID) เติมผ่าน SQS | 550e8400-e29b-...33 |
 | area_id | string | Y | อ้างอิงรหัสพื้นที่ที่เกิดการเปลี่ยนแปลง | TH-BKK-001 |
 | incident_type | string | Y | ประเภทของภัยพิบัติ (Service นี้กำหนดค่า "flood") | flood |
@@ -61,8 +61,8 @@
 | reporter_id | string | Y | รหัสผู้รายงาน หรือชื่อเซ็นเซอร์ | sensor-th-bkk-001 |
 | sync_status | enum | Y | สถานะเชื่อมต่อ (PENDING_RETRY, PENDING_INCIDENT, SUCCESS, CLOSED, FAILED_PERMANENTLY) | SUCCESS |
 | idempotency_key | string | Y | Trace ID สำหรับตรวจสอบการยิงซ้ำ (Deduplication) | uuid-trace-1234 |
-| retry_count | integer | Y | จำนวนรอบที่ Retry ไปแล้ว (สำหรับ Cron Job) | 0 |
-| next_retry_time | number | N | Unix timestamp สำหรับรอบการยิงซ้ำครั้งถัดไป (Backoff) | 1708560300000 |
+| retry_count | integer | Y | จำนวนรอบที่ Retry ไปแล้ว (สูงสุด 10 ครั้ง) | 0 |
+| next_retry_time | number | N | Unix timestamp สำหรับรอบการยิงซ้ำครั้งถัดไป | 1708560300000 |
 | remote_trace_id | string | N | Trace ID ที่ตอบกลับมาจากบริการส่วนกลาง | remote-uuid-5678 |
 | reported_at | datetime | Y | เวลาที่ออกรายงาน Incident ฉบับนี้ | 2026-02-21T10:00:00Z |
 | resolved_at | datetime | N | เวลาที่ได้รับสถานะ CLOSED จาก Webhook | 2026-02-22T10:00:00Z |
